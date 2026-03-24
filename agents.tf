@@ -27,6 +27,8 @@ module "agents" {
   cloudinit_write_files_common     = local.cloudinit_write_files_common
   k3s_kubelet_config               = var.k3s_kubelet_config
   k3s_kubelet_config_update_script = local.k3s_kubelet_config_update_script
+  k3s_audit_policy_config          = ""
+  k3s_audit_policy_update_script   = ""
   cloudinit_runcmd_common          = local.cloudinit_runcmd_common
   swap_size                        = each.value.swap_size
   zram_size                        = each.value.zram_size
@@ -35,7 +37,7 @@ module "agents" {
   disable_ipv6                     = each.value.disable_ipv6
   ssh_bastion                      = local.ssh_bastion
   network_id                       = data.hcloud_network.k3s.id
-  private_ipv4                     = cidrhost(hcloud_network_subnet.agent[[for i, v in var.agent_nodepools : i if v.name == each.value.nodepool_name][0]].ip_range, each.value.index + 101)
+  private_ipv4                     = cidrhost(hcloud_network_subnet.agent[[for i, v in var.agent_nodepools : i if v.name == each.value.nodepool_name][0]].ip_range, each.value.index + (local.network_size >= 16 ? 101 : floor(pow(local.subnet_size, 2) * 0.4)))
 
   labels = merge(local.labels, local.labels_agent_node)
 
@@ -47,7 +49,7 @@ module "agents" {
     hcloud_network_subnet.agent,
     hcloud_placement_group.agent,
     hcloud_server.nat_router,
-    null_resource.nat_router_await_cloud_init,
+    terraform_data.nat_router_await_cloud_init,
   ]
 }
 
@@ -55,7 +57,7 @@ locals {
   k3s-agent-config = { for k, v in local.agent_nodes : k => merge(
     {
       node-name = module.agents[k].name
-      server    = "https://${var.use_control_plane_lb ? hcloud_load_balancer_network.control_plane.*.ip[0] : module.control_planes[keys(module.control_planes)[0]].private_ipv4_address}:6443"
+      server    = local.k3s_endpoint
       token     = local.k3s_token
       # Kubelet arg precedence (last wins): local.kubelet_arg > v.kubelet_args > k3s_global_kubelet_args > k3s_agent_kubelet_args
       kubelet-arg = concat(
@@ -86,10 +88,10 @@ locals {
   }
 }
 
-resource "null_resource" "agent_config" {
+resource "terraform_data" "agent_config" {
   for_each = local.agent_nodes
 
-  triggers = {
+  triggers_replace = {
     agent_id = module.agents[each.key].id
     config   = sha1(yamlencode(local.k3s-agent-config[each.key]))
   }
@@ -118,11 +120,15 @@ resource "null_resource" "agent_config" {
     inline = [local.k3s_config_update_script]
   }
 }
+moved {
+  from = null_resource.agent_config
+  to   = terraform_data.agent_config
+}
 
-resource "null_resource" "agents" {
+resource "terraform_data" "agents" {
   for_each = local.agent_nodes
 
-  triggers = {
+  triggers_replace = {
     agent_id = module.agents[each.key].id
   }
 
@@ -162,10 +168,14 @@ resource "null_resource" "agents" {
   }
 
   depends_on = [
-    null_resource.first_control_plane,
-    null_resource.agent_config,
+    terraform_data.first_control_plane,
+    terraform_data.agent_config,
     hcloud_network_subnet.agent
   ]
+}
+moved {
+  from = null_resource.agents
+  to   = terraform_data.agents
 }
 
 resource "hcloud_volume" "longhorn_volume" {
@@ -184,10 +194,10 @@ resource "hcloud_volume" "longhorn_volume" {
   delete_protection = var.enable_delete_protection.volume
 }
 
-resource "null_resource" "configure_longhorn_volume" {
+resource "terraform_data" "configure_longhorn_volume" {
   for_each = { for k, v in local.agent_nodes : k => v if((v.longhorn_volume_size >= 10) && (v.longhorn_volume_size <= 10240) && var.enable_longhorn) }
 
-  triggers = {
+  triggers_replace = {
     agent_id = module.agents[each.key].id
   }
 
@@ -222,6 +232,10 @@ resource "null_resource" "configure_longhorn_volume" {
     hcloud_volume.longhorn_volume
   ]
 }
+moved {
+  from = null_resource.configure_longhorn_volume
+  to   = terraform_data.configure_longhorn_volume
+}
 
 resource "hcloud_floating_ip" "agents" {
   for_each = { for k, v in local.agent_nodes : k => v if coalesce(lookup(v, "floating_ip"), false) }
@@ -239,7 +253,7 @@ resource "hcloud_floating_ip_assignment" "agents" {
   server_id      = module.agents[each.key].id
 
   depends_on = [
-    null_resource.agents
+    terraform_data.agents
   ]
 }
 
@@ -255,10 +269,10 @@ resource "hcloud_rdns" "agents" {
   ]
 }
 
-resource "null_resource" "configure_floating_ip" {
+resource "terraform_data" "configure_floating_ip" {
   for_each = { for k, v in local.agent_nodes : k => v if coalesce(lookup(v, "floating_ip"), false) }
 
-  triggers = {
+  triggers_replace = {
     agent_id       = module.agents[each.key].id
     floating_ip_id = hcloud_floating_ip.agents[each.key].id
   }
@@ -309,4 +323,8 @@ resource "null_resource" "configure_floating_ip" {
   depends_on = [
     hcloud_floating_ip_assignment.agents
   ]
+}
+moved {
+  from = null_resource.configure_floating_ip
+  to   = terraform_data.configure_floating_ip
 }

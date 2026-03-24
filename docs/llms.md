@@ -236,6 +236,16 @@ module "kube-hetzner" {
   * **Impact:** If changed, `cluster_ipv4_cidr` and `service_ipv4_cidr` must be sub-ranges within this new `network_ipv4_cidr`.
 
 ```terraform
+  # The amount of subnets into which the network will be split. Must be a power of 2.
+  # subnet_amount = 256
+```
+
+* **`subnet_amount` (Number, Optional):**
+  * **Default:** `256`.
+  * **Purpose:** Determines into how many subnets the `network_ipv4_cidr` is divided.
+  * **Constraint:** Must be a power of 2. Each nodepool (control plane and agent) and potentially the NAT router takes one subnet. Ensure this is large enough for your planned number of nodepools.
+
+```terraform
   # Using the default configuration you can only create a maximum of 42 agent-nodepools.
   # This is due to the creation of a subnet for each nodepool with CIDRs being in the shape of 10.[nodepool-index].0.0/16 which collides with k3s' cluster and service IP ranges (defaults below).
   # Furthermore the maximum number of nodepools (controlplane and agent) is 50, due to a hard limit of 50 subnets per network, see https://docs.hetzner.com/cloud/networks/faq/.
@@ -613,7 +623,17 @@ The example shows three control plane nodepools, each with one node, in differen
   * **CNI Compatibility:** The comment states it works with supported CNIs (Flannel, Calico, Cilium).
   * **Cilium Specifics:** If you are using `cni_plugin = "cilium"` and also providing custom `cilium_values`, you become responsible for enabling/configuring WireGuard within those `cilium_values` yourself, as your custom values would likely override the module's default Cilium WireGuard setup.
   * **Performance:** WireGuard is generally efficient, but encryption always has some performance overhead.
-    
+
+```terraform
+  # Override the flannel backend used by k3s. When set, this takes precedence over enable_wireguard.
+  # Valid values: vxlan, host-gw, wireguard-native.
+  # flannel_backend = "vxlan"
+```
+
+* **`flannel_backend` (String, Optional):**
+  * **Default:** `null` (defaults to `vxlan`, or `wireguard-native` if `enable_wireguard = true`).
+  * **Purpose:** Explicitly configures the backend for the Flannel CNI.
+  * **Robot Node Context:** For clusters involving Hetzner Robot nodes connected via vSwitch, `wireguard-native` is recommended to avoid MTU issues often seen with VXLAN in that topology.
 
 **Section 2.5: Load Balancer Configuration**
 
@@ -721,6 +741,8 @@ The example shows three control plane nodepools, each with one node, in differen
   #      }
   #    ]
   #    # kubelet_args = ["kube-reserved=cpu=250m,memory=1500Mi,ephemeral-storage=1Gi", "system-reserved=cpu=250m,memory=300Mi"]
+  #    # swap_size = "2G"
+  #    # zram_size = "2G"
   #  }
   # ]
   #
@@ -748,6 +770,16 @@ The example shows three control plane nodepools, each with one node, in differen
       * Kubernetes taints to apply to nodes provisioned by the autoscaler in this pool.
       * **Format:** Each element in the list is a map with `key`, `value`, and `effect` (e.g., `NoSchedule`, `NoExecute`, `PreferNoSchedule`).
     * **`kubelet_args` (List of Strings, Optional):** Same purpose as in other nodepools, for passing custom arguments to kubelet on autoscaled nodes.
+    * **`swap_size` (String, Optional):**
+      * Examples: `"512M"`, `"2G"`, `"4G"`.
+      * Configures a swap file of the specified size on autoscaled nodes.
+      * **K3s/Kubernetes Consideration:** Kubernetes traditionally doesn't work well with swap. However, recent versions of k3s/kubelet can support it if the `NodeSwap` feature gate is enabled. Make sure you set `"feature-gates=NodeSwap=true"` in `k3s_global_kubelet_args` or `k3s_autoscaler_kubelet_args`.
+      * When set, nodes will automatically receive the `node.kubernetes.io/server-swap=enabled` label.
+    * **`zram_size` (String, Optional):**
+      * Examples: `"512M"`, `"1G"`.
+      * Configures zRAM (compressed RAM block device used for swap) on autoscaled nodes.
+      * Uses zstd compression algorithm for optimal performance.
+      * When set, nodes will automatically receive the `node.kubernetes.io/server-swap=enabled` label.
 * **`autoscaler_disable_ipv4` / `autoscaler_disable_ipv6` (Boolean, Optional):**
   * **Default:** `false`.
   * **Purpose:** If `true`, disables public IPv4/IPv6 on nodes created by the Cluster Autoscaler. Similar implications as for regular nodepools (private network only access if both are true).
@@ -821,6 +853,14 @@ The example shows three control plane nodepools, each with one node, in differen
   * **`cluster_autoscaler_server_creation_timeout` (Number, Optional):**
     * **Default:** `15` (minutes).
     * **Purpose:** The maximum time (in minutes) the Cluster Autoscaler will wait for a newly provisioned node to become ready and join the cluster. If the timeout is exceeded, the autoscaler may assume the node provisioning failed and attempt to delete it and try again.
+  * **`cluster_autoscaler_replicas` (Number, Optional):**
+    * **Default:** `1`.
+    * **Purpose:** Sets the replica count for the Cluster Autoscaler deployment. Increase to >1 for high availability (leader election is supported).
+  * **`cluster_autoscaler_resource_limits` (Boolean, Optional):**
+    * **Default:** `true`.
+    * **Purpose:** Whether to apply resource requests/limits to the autoscaler pod.
+  * **`cluster_autoscaler_resource_values` (Map, Optional):**
+    * **Purpose:** Customizes the specific CPU and memory requests/limits for the autoscaler pod.
 
 ```terraform
   # Additional Cluster Autoscaler binary configuration
@@ -961,7 +1001,7 @@ The example shows three control plane nodepools, each with one node, in differen
   * **Benefits:** Provides resilient, replicated storage for stateful applications, snapshotting, backups, etc.
   * **Impact:** Deploys Longhorn components (manager, engine, UI) as pods in your cluster. It will also typically set up a default StorageClass for Longhorn.
   * **Dependencies:** As mentioned, enabling Longhorn implicitly enables `iscsid`.
-  * **Configuration:** Can be further customized via `longhorn_replica_count`, `longhorn_fstype`, and the advanced `longhorn_values` block.
+  * **Configuration:** Can be further customized via `longhorn_replica_count`, `longhorn_fstype`, `longhorn_values`, and `longhorn_merge_values`.
 
 ```terraform
   # By default, longhorn is pulled from https://charts.longhorn.io.
@@ -1015,7 +1055,8 @@ The example shows three control plane nodepools, each with one node, in differen
 
 * **Longhorn Customization Path:**
   * **Simple:** Use `enable_longhorn`, `longhorn_replica_count`, `longhorn_fstype`.
-  * **Advanced:** Provide a `longhorn_values` block (discussed later) with custom Helm values to override any aspect of the Longhorn chart. If `longhorn_values` is provided, it takes precedence.
+  * **Advanced (full override):** Provide a `longhorn_values` block (discussed later) with custom Helm values. This replaces the module defaults.
+  * **Advanced (targeted override):** Use `longhorn_merge_values` to merge selected keys on top of defaults (or on top of `longhorn_values` if set). Prefer this for small changes such as image tag overrides.
   * **Post-Deploy:** Kubernetes `HelmChartConfig` Custom Resource (if k3s supports/deploys it) can be used to modify Helm release values after the initial deployment by Terraform.
 
 ```terraform
@@ -1064,6 +1105,32 @@ The example shows three control plane nodepools, each with one node, in differen
   * **Purpose:** Controls the deployment method for the Hetzner CCM.
     * `true`: The module uses Helm to install and manage the CCM. This is generally the modern, preferred way.
     * `false`: The module uses a legacy method, likely applying raw Kubernetes YAML manifests (`kubectl apply -f ...`). This might be for compatibility with older module versions or specific needs.
+
+```terraform
+  # To enable Hetzner CCM compatibility and connection with dedicated Robot servers, set the `robot_ccm_enabled` to "true", default is "false".
+  robot_ccm_enabled = true
+```
+
+* **`robot_ccm_enabled` (Boolean, Optional):**
+  * **Default:** `false`.
+  * **Purpose:** Enables the integration of Hetzner Robot dedicated servers via the Cloud Controller Manager (CCM). This is only activated if `robot_user` and `robot_password` are also provided.
+    * `true`: The HCCM is configured to allow connections to Robot Nodes.
+    * `false`: The HCCM won't handle connections to Robot Nodes
+
+```terraform
+  # Hetzner Cloud vSwitch ID. If defined, a subnet will be created in the IP-range defined by vswitch_subnet_index.
+  # vswitch_id = 12345
+
+  # Subnet index (0-255) for vSwitch.
+  # vswitch_subnet_index = 201
+```
+
+* **`vswitch_id` (Number, Optional):**
+  * **Default:** `null`.
+  * **Purpose:** Links a Hetzner vSwitch to the private network. Required for hybrid setups with Robot servers.
+* **`vswitch_subnet_index` (Number, Optional):**
+  * **Default:** `201`.
+  * **Purpose:** Defines which subnet index (within the `subnet_amount` range) is assigned to the vSwitch connection.
 
 ```terraform
   # See https://github.com/hetznercloud/csi-driver/releases for the available versions.
@@ -1151,10 +1218,10 @@ Excellent! Let's continue our meticulous dissection.
   # Automatically "true" in the case of single node cluster (as it does not make sense to use the Hetzner LB in that situation).
   # It can work with any ingress controller that you choose to deploy.
   # Please note that because the klipperLB points to all nodes, we automatically allow scheduling on the control plane when it is active.
-  # enable_klipper_metal_lb = "true"
+  # enable_klipper_metal_lb = true
 ```
 
-* **`enable_klipper_metal_lb` (Boolean, Optional, or String `"true"`/`"false"`):**
+* **`enable_klipper_metal_lb` (Boolean, Optional):**
   * **Default:** `false` (unless it's a single-node cluster, then it's automatically `true`).
   * **Purpose:** If `true`, deploys [Klipper LoadBalancer](https://github.com/k3s-io/klipper-lb) (which is k3s's embedded service load balancer, similar in concept to MetalLB for bare-metal clusters).
   * **Mechanism:** Klipper LB allows services of type `LoadBalancer` to get an IP address from a pool of the nodes' own IP addresses. For external access, this typically means one of the node's public IPs is used by the Ingress controller's service.
@@ -1886,6 +1953,18 @@ Excellent! Let's continue our meticulous dissection.
   * **Reference:** Consult the Hubble documentation for available metric types and configuration syntax.
 
 ```terraform
+  # Set the Cilium LoadBalancer & NodePort XDP Acceleration. Default: "best-effort".
+  # The setting "native" enforces XDP Acceleration on ports and "disabled" disables the acceleration, "best-effort" enables the XDP Acceleration if the interface supports it.
+  # See [Cilium XDP documentation](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/#loadbalancer-nodeport-xdp-acceleration).
+  # For Robot nodes connected over vSwitch, the XDP acceleration may not work on the Robot node and the setting therefore recommended to be set to "best-effort" or "disabled".
+  # cilium_loadbalancer_acceleration_mode = "best-effort"
+```
+
+* **`cilium_loadbalancer_acceleration_mode` (String, Optional, relevant if `cni_plugin = "cilium"`):**
+  * **Default:** `"best-effort"`.
+  * **Purpose:** Specifies the Loadbalancer Acceleration mode for Cilium (loadBalancer.acceleration). 
+
+```terraform
   # You can choose the version of Calico that you want. By default, the latest is used.
   # More info on available versions can be found at https://github.com/projectcalico/calico/releases
   # Please note that if you are getting 403s from Github, it's also useful to set the version manually. However there is rarely a need for that!
@@ -2034,6 +2113,7 @@ Locked and loaded! Let's continue the detailed exploration.
     * `true`: The control plane LB gets a public IP, making the Kube API accessible from the internet (subject to Kubernetes authN/authZ).
     * `false`: The control plane LB only gets a private IP within the Hetzner network. The Kube API would only be accessible from within that private network (e.g., via VPN, bastion, or other servers in the same network).
   * **Use Case for `false`:** Enhanced security by not exposing the Kube API directly to the public internet, even via an LB.
+  * **Integration with NAT Router:** When both `control_plane_lb_enable_public_interface = false` and `nat_router` are configured, the NAT router automatically forwards port 6443 to the control plane LB's private IP. This allows external kubectl access via the NAT router's public IP while keeping the control plane LB private. The generated kubeconfig will automatically use the NAT router's public IP as the server address.
 
 ```terraform
   # Let's say you are not using the control plane LB solution above, and still want to have one hostname point to all your control-plane nodes.
@@ -2058,12 +2138,48 @@ Locked and loaded! Let's continue the detailed exploration.
 
 * **`kubeconfig_server_address` (String, Optional):**
   * **Purpose:** Allows you to explicitly set the server address (hostname or IP) that will be written into the `server:` field of the generated kubeconfig file.
-  * **Default Behavior:** Without this, the kubeconfig might point to:
+  * **Default Behavior:** Without this, the kubeconfig will automatically point to:
+    * The public IP of the control plane LB (if `use_control_plane_lb = true` and `control_plane_lb_enable_public_interface = true`).
+    * The public IP of the NAT router (if `use_control_plane_lb = true`, `control_plane_lb_enable_public_interface = false`, and `nat_router` is configured).
+    * The private IP of the control plane LB (if `use_control_plane_lb = true`, `control_plane_lb_enable_public_interface = false`, and no `nat_router`).
     * The IP of the first control plane node (if no CP LB).
-    * The IP of the control plane LB (if `use_control_plane_lb = true`).
-    * The IP of the main application LB (if `enable_klipper_metal_lb = false` and no CP LB, though this is less common for API access).
-  * **Use Case:** If you've set up DNS Round Robin for your control plane nodes (as described for `additional_tls_sans`) and want your kubeconfig to use that hostname (e.g., `cp.cluster.my.org`) instead of a direct IP.
+  * **Use Case:** If you've set up DNS Round Robin for your control plane nodes (as described for `additional_tls_sans`) and want your kubeconfig to use that hostname (e.g., `cp.cluster.my.org`) instead of a direct IP, or if you have a custom ingress setup.
   * **Requirement:** If you use a hostname here, ensure it resolves correctly and is included in the API server's TLS certificate SANs (via `additional_tls_sans` or default k3s behavior).
+
+```terraform
+  # Optional external control plane endpoint URL (e.g. https://myapi.domain.com:6443).
+  # Used as the k3s 'server' value for agents and secondary control planes.
+  # control_plane_endpoint = "https://myapi.domain.com:6443"
+```
+
+* **`control_plane_endpoint` (String, Optional):**
+  * **Default:** `null`.
+  * **Purpose:** Specifies a custom external URL for the Kubernetes API server.
+  * **Use Case:** When using an external load balancer (not managed by this module) or a specific DNS alias for your control plane, set this to ensure agents register correctly against that endpoint.
+
+```terraform
+  # K3S audit-policy.yaml contents. Used to configure Kubernetes audit logging.
+  # k3s_audit_policy_config = <<-EOT
+  #   apiVersion: audit.k8s.io/v1
+  #   kind: Policy
+  #   rules:
+  #   - level: Metadata
+  # EOT
+  # k3s_audit_log_path = "/var/log/k3s-audit/audit.log"
+  # k3s_audit_log_maxage = 30
+  # k3s_audit_log_maxbackup = 10
+  # k3s_audit_log_maxsize = 100
+```
+
+* **`k3s_audit_policy_config` (String, Optional):**
+  * **Purpose:** Defines the Kubernetes Audit Policy. If provided, k3s is configured to log audit events matching these rules.
+  * **Format:** YAML string content for the policy file.
+* **`k3s_audit_log_*` variables:**
+  * **Purpose:** Configure the rotation and retention of audit logs on control plane nodes.
+  * `k3s_audit_log_path`: Path to audit log file (default: `/var/log/k3s-audit/audit.log`)
+  * `k3s_audit_log_maxage`: Days to retain logs (default: `30`)
+  * `k3s_audit_log_maxbackup`: Number of backup files to keep (default: `10`)
+  * `k3s_audit_log_maxsize`: Max size in MB before rotation (default: `100`)
 
 ```terraform
   # lb_hostname Configuration:
@@ -2324,7 +2440,7 @@ This section introduces the mechanism for providing detailed, custom Helm chart 
   # Please understand that the indentation is very important, inside the EOTs, as those are proper yaml helm values.
   # We advise you to use the default values, and only change them if you know what you are doing!
 
-  # You can inline the values here in heredoc-style (as the examples below with the <<EOT to EOT). Please note that the current indentation inside the EOT is important.
+  # You can inline the values here in heredoc-style (as the examples below with the <<-EOT to EOT). Please note that the indentation inside the EOT is important.
   # Or you can create a thepackage-values.yaml file with the content and use it here with the following syntax:
   # thepackage_values = file("thepackage-values.yaml")
 
@@ -2409,6 +2525,7 @@ controller:
 
 ```terraform
   # Longhorn, all Longhorn helm values can be found at https://github.com/longhorn/longhorn/blob/master/chart/values.yaml
+  # longhorn_values replaces module defaults. Prefer longhorn_merge_values for targeted overrides.
   # The following is an example, please note that the current indentation inside the EOT is important.
   /*   longhorn_values = <<-EOT
 defaultSettings:
@@ -2422,7 +2539,24 @@ persistence:
 
 * **`longhorn_values` (String, Optional, Heredoc/File Content):**
   * Provides custom Helm values for the Longhorn deployment if `enable_longhorn = true`.
+  * Replaces the module's default Longhorn values.
   * Example shows setting default data path, filesystem type, replica count, and whether Longhorn's StorageClass should be the cluster-wide default.
+
+```terraform
+  # Merge specific keys without replacing all defaults (recommended for hotfix image tags).
+  /*   longhorn_merge_values = <<-EOT
+image:
+  longhorn:
+    manager:
+      tag: v1.11.0-hotfix-1
+    instanceManager:
+      tag: v1.11.0-hotfix-1
+  EOT */
+```
+
+* **`longhorn_merge_values` (String, Optional, Heredoc/File Content):**
+  * Deep-merges your YAML on top of defaults (or on top of `longhorn_values` if set).
+  * Recommended when you only need to override a subset of values, such as specific image tags.
 
 ```terraform
   # If you want to use a specific Traefik helm chart version, set it below; otherwise, leave them as-is for the latest versions.
@@ -2439,7 +2573,7 @@ persistence:
   /*   traefik_values = <<-EOT
 deployment:
   replicas: 1 # Override default replica count logic
-globalArguments: [] # Can add global static config args here too
+additionalArguments: [] # Can add global static config args here too
 service:
   enabled: true
   type: LoadBalancer # Ensure service is of type LoadBalancer
@@ -2453,11 +2587,12 @@ service:
 
 ports: # Configure Traefik entrypoints
   web:
-    redirections: # Redirect HTTP (web) to HTTPS (websecure)
-      entryPoint:
-        to: websecure
-        scheme: https
-        permanent: true
+    http:
+      redirections: # Redirect HTTP (web) to HTTPS (websecure)
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
 
     proxyProtocol: # Configure PROXY protocol for web entrypoint
       trustedIPs:
@@ -2557,7 +2692,7 @@ controller:
   # Override values given to the HAProxy helm chart.
   # All HAProxy helm values can be found at https://github.com/haproxytech/helm-charts/blob/main/kubernetes-ingress/values.yaml
   # Default values can be found at https://github.com/kube-hetzner/terraform-hcloud-kube-hetzner/blob/master/locals.tf
-  /*   haproxy_values = <<EOT
+  /*   haproxy_values = <<-EOT
   EOT */
 ```
 
@@ -2601,7 +2736,7 @@ provider "hcloud" {
 }
 
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.10.1"
   required_providers {
     hcloud = {
       source  = "hetznercloud/hcloud"
@@ -2663,6 +2798,35 @@ variable "hcloud_token" {
     * If not, `var.hcloud_token` defaults to `""`, and the ternary operator then chooses `local.hcloud_token`.
   * This variable declaration is what allows `TF_VAR_hcloud_token` to populate `var.hcloud_token`.
 
+```terraform
+variable "robot_user" {
+  sensitive = true
+  default   = ""
+}
+```
+
+* **`variable "robot_user"` Block:**
+  * **Purpose:** Declares an input variable named `robot_user` for this root Terraform configuration. The value should be retrieved from the Hetzner Robot Webservice UI. This variable is required for connecting Robot Nodes to the cluster and is only used when `robot_ccm_enabled` is set to `true`.
+  * **`sensitive = true`:** Marks this input variable as sensitive. If you were to set it via a `terraform.tfvars` file or command line (`-var="hcloud_token=..."`), Terraform would handle it with more care regarding logging.
+  * **`default = ""`:** Provides a default value (empty string). This allows the logic `var.robot_user != "" ? var.robot_user : local.robot_user` to work correctly:
+    * If `TF_VAR_robot_user` is set in the environment, `var.robot_user` gets that value.
+    * If not, `var.robot_user` defaults to `""`, and the ternary operator then chooses `local.robot_user`.
+  * This variable declaration is what allows `TF_VAR_robot_user` to populate `var.robot_user`.
+
+```terraform
+variable "robot_password" {
+  sensitive = true
+  default   = ""
+}
+```
+
+* **`variable "robot_password"` Block:**
+  * **Purpose:** Declares an input variable named `robot_password` for this root Terraform configuration. The value should be retrieved from the Hetzner Robot Webservice UI. This variable is required for connecting Robot Nodes to the cluster and is only used when `robot_ccm_enabled` is set to `true`.
+  * **`sensitive = true`:** Marks this input variable as sensitive. If you were to set it via a `terraform.tfvars` file or command line (`-var="hcloud_token=..."`), Terraform would handle it with more care regarding logging.
+  * **`default = ""`:** Provides a default value (empty string). This allows the logic `var.robot_password != "" ? var.robot_password : local.robot_password` to work correctly:
+    * If `TF_VAR_robot_password` is set in the environment, `var.robot_password` gets that value.
+    * If not, `var.robot_password` defaults to `""`, and the ternary operator then chooses `local.robot_password`.
+  * This variable declaration is what allows `TF_VAR_robot_password` to populate `var.robot_password`.
 ---
 
 **Conclusion of the Deep Dive**
@@ -2702,14 +2866,18 @@ The following variables have been added to the `kube-hetzner` module since the i
 * **`nat_router` (Object, Optional):**
   * **Purpose:** Creates a dedicated NAT router server that acts as the single egress point for all cluster traffic. When enabled, all control plane and agent nodes are provisioned without public IPs.
   * **Requirements:** Must set `use_control_plane_lb = true` when using NAT router, as kubectl needs a public endpoint to reach the cluster.
-  * **Benefits:** 
+  * **Benefits:**
     * Enhanced security by limiting public exposure to a single hardened node
     * Acts as a bastion host for SSH access to internal nodes
     * Simplifies firewall rules and security auditing
+    * Automatically forwards Kubernetes API traffic (port 6443) when `control_plane_lb_enable_public_interface = false`
   * **Trade-offs:** Introduces a single point of failure for egress traffic
   * **Configuration:**
     * `server_type`: The Hetzner server type for the NAT router
     * `location`: The location where the NAT router should be deployed
+    * `labels`: (Optional) Additional labels for the NAT router
+    * `enable_sudo`: (Optional, default: false) Enable sudo access for the nat-router user
+  * **Port Forwarding:** When the control plane LB has no public interface (`control_plane_lb_enable_public_interface = false`), the NAT router automatically configures iptables rules to forward incoming traffic on port 6443 to the control plane LB's private IP. This allows external kubectl access while keeping the control plane LB completely private.
 
 **k3s Binary Configuration**
 
@@ -2846,43 +3014,60 @@ The following variables have been added to the `kube-hetzner` module since the i
   * **Discovery:** `hcloud image list --selector 'microos-snapshot=yes'`
   * **Use Case:** Ensure consistency across deployments or rollback to known-good images
 
+**vSwitch Configuration**
+
+```terraform
+  # To connect the Hetzner Cloud network to Robot servers via vSwitch subnet, create the vSwitch and set its ID to the `vswitch_id` (number).
+  # Note that the VLAN ID is not the same as vSwitch ID. The vSwitch-subnet is assigned to 10.201.0.0/16 by default, can be changed via var.vswitch_subnet_index.
+  # The vSwitch subnet is not created when the value is null. Default: null
+  # vswitch_id = null
+```
+
+* **`vswitch_id` (number, Optional):**
+  * **Purpose:** Connects the Cloud network to a pre-existing Hetzner vSwitch by creating a vSwitch-type subnet. It also exposes Cloud network routes to the vSwitch.
+  * **Requirements:** vSwitch must exist
+  * **Use Case:** The connection is required if Hetzner Robot instances are connected to the Hetzner Cloud instances via private networking  
+
+* **`vswitch_subnet_index` (number, Optional):**
+  * **Purpose:** Defines the subnet range index to be used in the vSwitch subnet creation. Default: 201, which then converts to 10.201.0.0/16 by default.
+
 **Additional Helm Values Customization**
 
 The following variables allow deep customization of various components through Helm values:
 
 ```terraform
   # Custom Cilium values
-  # cilium_values = <<EOT
+  # cilium_values = <<-EOT
   # ipam:
   #   mode: kubernetes
   # EOT
   
   # Custom cert-manager values
-  # cert_manager_values = <<EOT
+  # cert_manager_values = <<-EOT
   # crds:
   #   enabled: true
   # EOT
   
   # Custom Hetzner CCM values
-  # hetzner_ccm_values = <<EOT
+  # hetzner_ccm_values = <<-EOT
   # networking:
   #   enabled: true
   # EOT
   
   # Custom CSI driver SMB values
-  # csi_driver_smb_values = <<EOT
+  # csi_driver_smb_values = <<-EOT
   # controller:
   #   replicas: 2
   # EOT
   
   # Custom Longhorn values
-  # longhorn_values = <<EOT
+  # longhorn_values = <<-EOT
   # defaultSettings:
   #   defaultDataPath: /var/longhorn
   # EOT
   
   # Custom Rancher values
-  # rancher_values = <<EOT
+  # rancher_values = <<-EOT
   # hostname: rancher.example.com
   # replicas: 3
   # EOT
@@ -2903,13 +3088,13 @@ Each of these `*_values` variables:
   # haproxy_version = "1.41.0"
   
   # Custom Traefik values
-  # traefik_values = <<EOT
+  # traefik_values = <<-EOT
   # deployment:
   #   replicas: 3
   # EOT
   
   # Custom Nginx values
-  # nginx_values = <<EOT
+  # nginx_values = <<-EOT
   # controller:
   #   replicaCount: 3
   # EOT
@@ -2918,7 +3103,7 @@ Each of these `*_values` variables:
   # haproxy_additional_proxy_protocol_ips = ["10.0.0.0/8", "172.16.0.0/12"]
   # haproxy_requests_cpu = "250m"
   # haproxy_requests_memory = "256Mi"
-  # haproxy_values = <<EOT
+  # haproxy_values = <<-EOT
   # controller:
   #   replicaCount: 3
   # EOT

@@ -10,9 +10,12 @@ locals {
   # if given as a variable, we want to use the given token. This is needed to restore the cluster
   k3s_token = var.k3s_token == null ? random_password.k3s_token.result : var.k3s_token
 
+  # k3s endpoint used for agent registration, respects control_plane_endpoint override
+  k3s_endpoint = coalesce(var.control_plane_endpoint, "https://${var.use_control_plane_lb ? hcloud_load_balancer_network.control_plane.*.ip[0] : module.control_planes[keys(module.control_planes)[0]].private_ipv4_address}:6443")
+
   ccm_version    = var.hetzner_ccm_version != null ? var.hetzner_ccm_version : data.github_release.hetzner_ccm[0].release_tag
   csi_version    = length(data.github_release.hetzner_csi) == 0 ? var.hetzner_csi_version : data.github_release.hetzner_csi[0].release_tag
-  kured_version  = var.kured_version != null ? var.kured_version : data.github_release.kured[0].release_tag
+  kured_version  = length(data.github_release.kured) == 0 ? var.kured_version : data.github_release.kured[0].release_tag
   calico_version = length(data.github_release.calico) == 0 ? var.calico_version : data.github_release.calico[0].release_tag
 
   # Determine kured YAML suffix based on version (>= 1.20.0 uses -combined.yaml, < 1.20.0 uses -dockerhub.yaml)
@@ -23,9 +26,31 @@ locals {
   # Check if the user has set custom DNS servers.
   has_dns_servers = length(var.dns_servers) > 0
 
+  # Bit size of the "network_ipv4_cidr".
+  network_size = 32 - split("/", var.network_ipv4_cidr)[1]
+
+  # Bit size of each subnet
+  subnet_size = local.network_size - log(var.subnet_amount, 2)
+
   # Separate out IPv4 and IPv6 DNS hosts.
   dns_servers_ipv4 = [for ip in var.dns_servers : ip if provider::assert::ipv4(ip)]
   dns_servers_ipv6 = [for ip in var.dns_servers : ip if provider::assert::ipv6(ip)]
+
+  use_robot_ccm = var.robot_ccm_enabled && var.robot_user != "" && var.robot_password != ""
+  # Key of the kube_system_secret-items is the name of the Secret. Values of those items are the key-value pairs of Secret.
+  kube_system_secrets = {
+    "hcloud" = merge(
+      {
+        "token"   = var.hcloud_token,
+        "network" = data.hcloud_network.k3s.name
+      },
+      local.use_robot_ccm ? {
+        "robot-user"     = var.robot_user,
+        "robot-password" = var.robot_password
+      } : {}
+    ),
+    "hcloud-csi" = { "token" = var.hcloud_token }
+  }
 
   additional_k3s_environment = join("\n",
     [
@@ -234,7 +259,7 @@ locals {
         nodepool_name : nodepool_obj.name,
         server_type : nodepool_obj.server_type,
         location : nodepool_obj.location,
-        labels : concat(local.default_control_plane_labels, nodepool_obj.swap_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
+        labels : concat(local.default_control_plane_labels, nodepool_obj.swap_size != "" || nodepool_obj.zram_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
         taints : compact(concat(local.default_control_plane_taints, nodepool_obj.taints)),
         kubelet_args : nodepool_obj.kubelet_args,
         backups : nodepool_obj.backups,
@@ -263,7 +288,7 @@ locals {
         floating_ip : lookup(nodepool_obj, "floating_ip", false),
         floating_ip_rdns : lookup(nodepool_obj, "floating_ip_rdns", false),
         location : nodepool_obj.location,
-        labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
+        labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" || nodepool_obj.zram_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
         taints : compact(concat(local.default_agent_taints, nodepool_obj.taints)),
         kubelet_args : nodepool_obj.kubelet_args,
         backups : lookup(nodepool_obj, "backups", false),
@@ -293,7 +318,7 @@ locals {
           floating_ip : lookup(nodepool_obj, "floating_ip", false),
           floating_ip_rdns : lookup(nodepool_obj, "floating_ip_rdns", false),
           location : nodepool_obj.location,
-          labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
+          labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" || nodepool_obj.zram_size != "" ? local.swap_node_label : [], nodepool_obj.labels),
           taints : compact(concat(local.default_agent_taints, nodepool_obj.taints)),
           kubelet_args : nodepool_obj.kubelet_args,
           backups : lookup(nodepool_obj, "backups", false),
@@ -309,7 +334,7 @@ locals {
         },
         { for key, value in node_obj : key => value if value != null },
         {
-          labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" ? local.swap_node_label : [], nodepool_obj.labels, coalesce(node_obj.labels, [])),
+          labels : concat(local.default_agent_labels, nodepool_obj.swap_size != "" || nodepool_obj.zram_size != "" ? local.swap_node_label : [], nodepool_obj.labels, coalesce(node_obj.labels, [])),
           taints : compact(concat(local.default_agent_taints, nodepool_obj.taints, coalesce(node_obj.taints, []))),
         },
         (
@@ -341,9 +366,9 @@ locals {
     bastion_private_key = null
   }
 
-  # Create 256 /24 subnets from the base network CIDR.
-  # Control planes allocate from the end (255, 254, 253...) and agents from the start (0, 1, 2...)
-  network_ipv4_subnets = [for index in range(256) : cidrsubnet(var.network_ipv4_cidr, 8, index)]
+  # Create subnets from the base network CIDR.
+  # Control planes allocate from the end of the range and agents from the start (0, 1, 2...)
+  network_ipv4_subnets = [for index in range(var.subnet_amount) : cidrsubnet(var.network_ipv4_cidr, log(var.subnet_amount, 2), index)]
 
   # By convention the DNS service (usually core-dns) is assigned the 10th IP address in the service CIDR block
   cluster_dns_ipv4 = var.cluster_dns_ipv4 != null ? var.cluster_dns_ipv4 : cidrhost(var.service_ipv4_cidr, 10)
@@ -391,6 +416,13 @@ locals {
   allow_scheduling_on_control_plane = local.is_single_node_cluster ? true : var.allow_scheduling_on_control_plane
   # Determine if loadbalancer target should be allowed on control plane nodes, which will be always true for single node clusters or if scheduling is allowed on control plane nodes
   allow_loadbalancer_target_on_control_plane = local.is_single_node_cluster ? true : var.allow_scheduling_on_control_plane
+
+  # Build list of label maps to include in LB target selector based on allow_loadbalancer_target_on_control_plane
+  lb_target_groups = (
+    local.allow_loadbalancer_target_on_control_plane ?
+    [local.labels_control_plane_node, local.labels_agent_node] :
+    [local.labels_agent_node]
+  )
 
   # Default k3s node labels
   default_agent_labels = concat(
@@ -548,7 +580,7 @@ locals {
   cni_k3s_settings = {
     "flannel" = {
       disable-network-policy = var.disable_network_policy
-      flannel-backend        = var.enable_wireguard ? "wireguard-native" : "vxlan"
+      flannel-backend        = var.flannel_backend != null ? var.flannel_backend : (var.enable_wireguard ? "wireguard-native" : "vxlan")
     }
     "calico" = {
       disable-network-policy = true
@@ -570,7 +602,16 @@ locals {
   kube_controller_manager_arg = "flex-volume-plugin-dir=/var/lib/kubelet/volumeplugins"
   flannel_iface               = "eth1"
 
-  kube_apiserver_arg = var.authentication_config != "" ? ["authentication-config=/etc/rancher/k3s/authentication_config.yaml"] : []
+  kube_apiserver_arg = concat(
+    var.authentication_config != "" ? ["authentication-config=/etc/rancher/k3s/authentication_config.yaml"] : [],
+    var.k3s_audit_policy_config != "" ? [
+      "audit-policy-file=/etc/rancher/k3s/audit-policy.yaml",
+      "audit-log-path=${var.k3s_audit_log_path}",
+      "audit-log-maxage=${var.k3s_audit_log_maxage}",
+      "audit-log-maxbackup=${var.k3s_audit_log_maxbackup}",
+      "audit-log-maxsize=${var.k3s_audit_log_maxsize}"
+    ] : []
+  )
 
   cilium_values_default = <<EOT
 # Enable Kubernetes host-scope IPAM mode (required for K3s + Hetzner CCM)
@@ -581,6 +622,7 @@ k8s:
 
 # Replace kube-proxy with Cilium
 kubeProxyReplacement: true
+
 %{if var.disable_kube_proxy}
 # Enable health check server (healthz) for the kube-proxy replacement
 kubeProxyReplacementHealthzBindAddr: "0.0.0.0:10256"
@@ -609,7 +651,7 @@ endpointRoutes:
 
 loadBalancer:
   # Enable LoadBalancer & NodePort XDP Acceleration (direct routing (routingMode=native) is recommended to achieve optimal performance)
-  acceleration: native
+  acceleration: "${var.cilium_loadbalancer_acceleration_mode}"
 
 bpf:
   # Enable eBPF-based Masquerading ("The eBPF-based implementation is the most efficient implementation")
@@ -640,7 +682,7 @@ hubble:
 %{endif~}
 
 
-MTU: 1450
+MTU: %{if local.use_robot_ccm} 1350 %{else} 1450 %{endif}
   EOT
 
   cilium_values = module.values_merger_cilium.values
@@ -743,6 +785,11 @@ controller:
 networking:
   enabled: true
   clusterCIDR: "${var.cluster_ipv4_cidr}"
+%{if local.use_robot_ccm~}
+robot:
+  enabled: true
+%{endif~}
+
 args:
   cloud-provider: hcloud
   allow-untagged-cloud: ""
@@ -760,6 +807,10 @@ env:
     value: "${!local.using_klipper_lb}"
   HCLOUD_LOAD_BALANCERS_DISABLE_PRIVATE_INGRESS:
     value: "true"
+%{if local.use_robot_ccm~}
+  HCLOUD_NETWORK_ROUTES_ENABLED:
+    value: "false"
+%{endif~}
 # Use host network to avoid circular dependency with CNI
 hostNetwork: true
   EOT
@@ -820,7 +871,6 @@ image:
   tag: ${var.traefik_image_tag}
 deployment:
   replicas: ${local.ingress_replica_count}
-globalArguments: []
 service:
   enabled: true
   type: LoadBalancer
@@ -846,11 +896,12 @@ ports:
 %{if var.traefik_redirect_to_https || !local.using_klipper_lb~}
   web:
 %{if var.traefik_redirect_to_https~}
-    redirections:
-      entryPoint:
-        to: websecure
-        scheme: https
-        permanent: true
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
 %{endif~}
 %{if !local.using_klipper_lb~}
     proxyProtocol:
@@ -1075,6 +1126,39 @@ else
 fi
 EOF
 
+k3s_audit_policy_update_script = <<EOF
+DATE=`date +%Y-%m-%d_%H-%M-%S`
+if [ -z "${var.k3s_audit_policy_config}" ] || [ "${var.k3s_audit_policy_config}" = " " ]; then
+  echo "No audit policy config provided via Terraform, skipping audit policy setup"
+  # Note: We intentionally DO NOT remove existing audit policies here.
+  # This preserves any manually-configured audit policies for backward compatibility.
+  exit 0
+fi
+
+# Config is provided, proceed with audit policy setup
+if cmp -s /tmp/audit-policy.yaml /etc/rancher/k3s/audit-policy.yaml; then
+  echo "No update required to the audit-policy.yaml file"
+else
+  if [ -f "/etc/rancher/k3s/audit-policy.yaml" ]; then
+    echo "Backing up /etc/rancher/k3s/audit-policy.yaml to /tmp/audit-policy_$DATE.yaml"
+    cp /etc/rancher/k3s/audit-policy.yaml /tmp/audit-policy_$DATE.yaml
+  fi
+  echo "Updated audit-policy.yaml detected, restart of k3s service required"
+  cp /tmp/audit-policy.yaml /etc/rancher/k3s/audit-policy.yaml
+  if systemctl is-active --quiet k3s; then
+    systemctl restart k3s || (echo "Error: Failed to restart k3s. Restoring /etc/rancher/k3s/audit-policy.yaml from backup" && cp /tmp/audit-policy_$DATE.yaml /etc/rancher/k3s/audit-policy.yaml && systemctl restart k3s)
+  else
+    echo "k3s service is not active, skipping restart"
+  fi
+  echo "k3s service restarted successfully with new audit policy"
+fi
+
+# Ensure audit log directory exists with proper permissions
+mkdir -p $(dirname ${var.k3s_audit_log_path})
+chmod 750 $(dirname ${var.k3s_audit_log_path})
+chown root:root $(dirname ${var.k3s_audit_log_path})
+EOF
+
 k3s_authentication_config_update_script = <<EOF
 DATE=`date +%Y-%m-%d_%H-%M-%S`
 if cmp -s /tmp/authentication_config.yaml /etc/rancher/k3s/authentication_config.yaml; then
@@ -1216,84 +1300,8 @@ cloudinit_write_files_common = <<EOT
 
 # Create the kube_hetzner_selinux.te file, that allows in SELinux to not interfere with various needed services
 - path: /root/kube_hetzner_selinux.te
-  content: |
-    module kube_hetzner_selinux 1.0;
-
-    require {
-        type kernel_t, bin_t, kernel_generic_helper_t, iscsid_t, iscsid_exec_t, var_run_t, var_lib_t,
-            init_t, unlabeled_t, systemd_logind_t, systemd_hostnamed_t, container_t,
-            cert_t, container_var_lib_t, etc_t, usr_t, container_file_t, container_log_t,
-            container_share_t, container_runtime_exec_t, container_runtime_t, var_log_t, proc_t, io_uring_t, fuse_device_t, http_port_t,
-            container_var_run_t;
-        class key { read view };
-        class file { open read execute execute_no_trans create link lock rename write append setattr unlink getattr watch };
-        class sock_file { watch write create unlink };
-        class unix_dgram_socket create;
-        class unix_stream_socket { connectto read write };
-        class dir { add_name create getattr link lock read rename remove_name reparent rmdir setattr unlink search write watch };
-        class lnk_file { read create };
-        class system module_request;
-        class filesystem associate;
-        class bpf map_create;
-        class io_uring sqpoll;
-        class anon_inode { create map read write };
-        class tcp_socket name_connect;
-        class chr_file { open read write };
-    }
-
-    #============= kernel_generic_helper_t ==============
-    allow kernel_generic_helper_t bin_t:file execute_no_trans;
-    allow kernel_generic_helper_t kernel_t:key { read view };
-    allow kernel_generic_helper_t self:unix_dgram_socket create;
-
-    #============= iscsid_t ==============
-    allow iscsid_t iscsid_exec_t:file execute;
-    allow iscsid_t var_run_t:sock_file write;
-    allow iscsid_t var_run_t:unix_stream_socket connectto;
-
-    #============= init_t ==============
-    allow init_t unlabeled_t:dir { add_name remove_name rmdir search };
-    allow init_t unlabeled_t:lnk_file create;
-    allow init_t container_t:file { open read };
-    allow init_t container_file_t:file { execute execute_no_trans };
-    allow init_t fuse_device_t:chr_file { open read write };
-    allow init_t http_port_t:tcp_socket name_connect;
-
-    #============= systemd_logind_t ==============
-    allow systemd_logind_t unlabeled_t:dir search;
-
-    #============= systemd_hostnamed_t ==============
-    allow systemd_hostnamed_t unlabeled_t:dir search;
-
-    #============= container_t ==============
-    allow container_t { cert_t container_log_t }:dir read;
-    allow container_t { cert_t container_log_t }:lnk_file read;
-    allow container_t cert_t:file { read open };
-    allow container_t container_var_lib_t:dir { add_name remove_name write read create };
-    allow container_t container_var_lib_t:file { append create open read write rename lock setattr getattr unlink };
-    allow container_t etc_t:dir { add_name remove_name write create setattr watch };
-    allow container_t etc_t:file { create setattr unlink write };
-    allow container_t etc_t:sock_file { create unlink };
-    allow container_t usr_t:dir { add_name create getattr link lock read rename remove_name reparent rmdir setattr unlink search write };
-    allow container_t usr_t:file { append create execute getattr link lock read rename setattr unlink write };
-    allow container_t container_file_t:file { open read write append getattr setattr lock };
-    allow container_t container_file_t:sock_file watch;
-    allow container_t container_log_t:file { open read write append getattr setattr watch };
-    allow container_t container_share_t:dir { read write add_name remove_name };
-    allow container_t container_share_t:file { read write create unlink };
-    allow container_t container_runtime_exec_t:file { read execute execute_no_trans open };
-    allow container_t container_runtime_t:unix_stream_socket { connectto read write };
-    allow container_t kernel_t:system module_request;
-    allow container_t var_log_t:dir { add_name write remove_name watch read };
-    allow container_t var_log_t:file { create lock open read setattr write unlink getattr };
-    allow container_t var_lib_t:dir { add_name remove_name write read create };
-    allow container_t var_lib_t:file { append create open read write rename lock setattr getattr unlink };
-    allow container_t proc_t:filesystem associate;
-    allow container_t self:bpf map_create;
-    allow container_t self:io_uring sqpoll;
-    allow container_t io_uring_t:anon_inode { create map read write };
-    allow container_t container_var_run_t:dir { add_name remove_name write };
-    allow container_t container_var_run_t:file { create open read rename unlink write };
+  encoding: base64
+  content: ${base64encode(file("${path.module}/templates/kube-hetzner-selinux.te"))}
 
 # Create the k3s registries file if needed
 %{if var.k3s_registries != ""}
@@ -1353,6 +1361,11 @@ cloudinit_runcmd_common = <<EOT
 # Cleanup some logs
 - [truncate, '-s', '0', '/var/log/audit/audit.log']
 
+# Create audit log directory for k3s
+- [mkdir, '-p', '${dirname(var.k3s_audit_log_path)}']
+- [chmod, '750', '${dirname(var.k3s_audit_log_path)}']
+- [chown, 'root:root', '${dirname(var.k3s_audit_log_path)}']
+
 # Add logic to truly disable SELinux if disable_selinux = true.
 # We'll do it by appending to cloudinit_runcmd_common.
 %{if var.disable_selinux}
@@ -1376,5 +1389,14 @@ check "ccm_lb_has_eligible_targets" {
   assert {
     condition     = !(var.exclude_agents_from_external_load_balancers && !local.allow_loadbalancer_target_on_control_plane)
     error_message = "Warning: exclude_agents_from_external_load_balancers=true with allow_scheduling_on_control_plane=false leaves NO eligible targets for CCM-managed LoadBalancer services. Either set allow_scheduling_on_control_plane=true or disable exclude_agents_from_external_load_balancers."
+  }
+}
+
+check "system_upgrade_window_requires_supported_controller_version" {
+  assert {
+    condition = var.system_upgrade_schedule_window == null ? true : (
+      try(provider::semvers::compare(trimprefix(var.sys_upgrade_controller_version, "v"), "0.15.0"), -1) >= 0
+    )
+    error_message = "system_upgrade_schedule_window requires sys_upgrade_controller_version v0.15.0 or newer."
   }
 }

@@ -14,7 +14,7 @@ In order to use NVMe and external disks with Longhorn, you may need to mount an 
 
 2.  Set the Helm values for Longhorn. The `defaultDataPath` is important as this path is automatically created by Longhorn and will be the default storage class pointing to your primary disks (e.g., NVMe).
     ```yaml
-    longhorn_values = <<EOT
+    longhorn_values = <<-EOT
     defaultSettings:
       nodeDrainPolicy: allow-if-replica-is-stopped
       defaultDataPath: /var/longhorn
@@ -65,7 +65,7 @@ data "kubernetes_nodes" "ssd_nodes" {
 # Patch the selected Longhorn nodes to add the new disk
 # IMPORTANT: The "path" value below must match the 'longhorn_mount_path' for the nodes
 # selected by the 'storage=ssd' label.
-resource "null_resource" "longhorn_patch_external_disk" {
+resource "terraform_data" "longhorn_patch_external_disk" {
   for_each = {
     for node in data.kubernetes_nodes.ssd_nodes.nodes : node.metadata[0].name => node.metadata[0].name
   }
@@ -106,5 +106,5 @@ resource "kubernetes_manifest" "longhorn_ssd_storageclass" {
     volumeBindingMode    = "Immediate"
   }
 
-  depends_on = [null_resource.longhorn_patch_external_disk]
+  depends_on = [terraform_data.longhorn_patch_external_disk]
 }
